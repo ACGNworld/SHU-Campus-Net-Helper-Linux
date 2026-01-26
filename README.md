@@ -1,8 +1,11 @@
 # SHU-Campus-Net-Helper (上海大学校园网助手)
+<img width="803" height="884" alt="5f93b4419500c53552cdeb871ad4ce9b" src="https://github.com/user-attachments/assets/b19fe8c1-23ea-4eff-9ebb-d6b46e2893ef" />
 
-## 📖 项目简介
+##  项目简介
 这是一个基于 Python 开发的上海大学校园网自动连接工具。
 能够智能识别输入框并完成登录
+默认访问地址是10.10.9.9，可用于实验室服务器周期性自动网络验证
+当前开发版本仅支持windows系统，提供python源码便于拓展linux版本
 
 **✨ 核心功能：**
 * **自动连接**：开机自启，断网自动重连。
@@ -11,7 +14,7 @@
 
 ---
 
-## 🛠️ 使用指南
+##  使用步骤
 
 ### 1. 下载与运行
 1.  在右侧 **Releases** 页面下载最新版本的 `SHU校园网助手.exe`。
@@ -32,13 +35,31 @@
 
 ---
 
-## ⚙️ 开机自启
+## 开机自启
+### 一键进入自启动目录
 1.  按 `Win + R`，输入 `shell:startup`。
 2.  将 `exe` 文件的**快捷方式**拖入打开的文件夹中即可。
 
+### 手动进入自启动目录
+如果直接访问失败，可以手动找到类似如下地址
+C:\Users\你的用户名\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup
+
+* 在顶部的菜单栏，点击 “查看”，然后把 “隐藏的项目” 勾选上
+* 依次进入以下路径：
+* C 盘
+* 用户 (Users)
+* 你的用户名文件夹 (例如 xxx 或 Administrator)
+* AppData (是半透明的隐藏文件夹)
+* Roaming 
+* Microsoft
+* Windows
+* 「开始」菜单 (Start Menu)
+* 程序 (Programs)  程序
+* 启动 (Startup)
+
 ---
 
-## 💻 开发者指南
+##  开发者指南
 
 ### 环境依赖
 * Python 3.8+
