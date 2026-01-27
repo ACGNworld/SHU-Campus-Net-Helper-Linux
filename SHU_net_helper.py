@@ -10,7 +10,8 @@ import os
 import sys
 import json
 import traceback
-import subprocess  # 用于获取ipconfig
+import subprocess
+import socket      # 用于获取主机名
 import smtplib     # 用于发送邮件
 from email.mime.text import MIMEText
 from email.header import Header
@@ -27,7 +28,7 @@ EMAIL_CONFIG_FILE = "email_config.json"
 class NetworkAutoLoginApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SHU校园网助手 v0.2.0")
+        self.root.title("SHU校园网助手-linux v0.3.0")
         self.root.geometry("520x550")
         
         # 点击窗口关闭按钮时，隐藏到托盘而不是退出
@@ -142,8 +143,15 @@ class NetworkAutoLoginApp:
     def get_ipconfig_info(self):
         """获取本机完整的网络配置信息"""
         try:
-            # Windows 中文系统通常是 gbk 编码
-            result = subprocess.check_output("ipconfig /all", shell=True).decode('gbk', errors='ignore')
+            if sys.platform.startswith('win'):
+                # Windows 中文系统通常是 gbk 编码
+                result = subprocess.check_output("ipconfig /all", shell=True).decode('gbk', errors='ignore')
+            else:
+                # Linux 系统通常使用 ip addr 或 ifconfig
+                try:
+                    result = subprocess.check_output("ip addr", shell=True).decode('utf-8', errors='ignore')
+                except:
+                    result = subprocess.check_output("ifconfig", shell=True).decode('utf-8', errors='ignore')
             return result
         except Exception as e:
             return f"获取 IP 信息失败: {e}"
@@ -181,30 +189,73 @@ class NetworkAutoLoginApp:
             
             # 构建邮件
             msg = MIMEText(content, 'plain', 'utf-8')
-            pc_name = os.getenv('COMPUTERNAME', 'MyPC')
+            pc_name = socket.gethostname()
             subject = f"【网络已连接】{pc_name} IP配置报告 - {datetime.now().strftime('%m-%d %H:%M')}"
             
             msg['Subject'] = Header(subject, 'utf-8')
             msg['From'] = cfg['sender']
             msg['To'] = cfg['target']
 
-            # 发送 (使用 SSL 465端口)
-            server = smtplib.SMTP_SSL(cfg['smtp'], 465)
-            server.login(cfg['sender'], cfg['pwd'])
-            server.sendmail(cfg['sender'], [cfg['target']], msg.as_string())
-            server.quit()
-            
-            self.log("✅ IP 邮件发送成功！")
+            # 尝试发送 - 先试 465 (SSL)，再试 587 (STARTTLS)
+            success = False
+            error_msgs = []
+
+            # 尝试方式 1: Port 465 (SSL)
+            try:
+                self.log(f"尝试连接 SMTP (SSL/465): {cfg['smtp']}...")
+                server = smtplib.SMTP_SSL(cfg['smtp'], 465, timeout=15)
+                server.login(cfg['sender'], cfg['pwd'])
+                server.sendmail(cfg['sender'], [cfg['target']], msg.as_string())
+                server.quit()
+                success = True
+            except Exception as e:
+                error_msgs.append(f"Port 465 失败: {e}")
+
+            # 尝试方式 2: Port 587 (STARTTLS)
+            if not success:
+                try:
+                    self.log(f"尝试连接 SMTP (STARTTLS/587): {cfg['smtp']}...")
+                    server = smtplib.SMTP(cfg['smtp'], 587, timeout=15)
+                    server.starttls()
+                    server.login(cfg['sender'], cfg['pwd'])
+                    server.sendmail(cfg['sender'], [cfg['target']], msg.as_string())
+                    server.quit()
+                    success = True
+                except Exception as e:
+                    error_msgs.append(f"Port 587 失败: {e}")
+
+            if success:
+                self.log("✅ IP 邮件发送成功！")
+            else:
+                self.log(f"❌ 邮件发送全部失败:\n" + "\n".join(error_msgs))
+
         except Exception as e:
-            self.log(f"❌ 邮件发送失败: {e}")
+            self.log(f"❌ 准备发送过程出错: {e}")
 
     # ==================== 浏览器核心模块 ====================
     def get_browser(self):
         try:
             co = ChromiumOptions()
             co.auto_port()
+            
+            # Linux 下自动寻找浏览器路径
+            if not sys.platform.startswith('win'):
+                import shutil
+                # 尝试寻找常见的浏览器命令
+                browser_path = shutil.which('microsoft-edge') or \
+                               shutil.which('microsoft-edge-stable') or \
+                               shutil.which('google-chrome') or \
+                               shutil.which('chromium') or \
+                               shutil.which('chromium-browser')
+                
+                if browser_path:
+                    co.set_browser_path(browser_path)
+                    self.log(f"找到浏览器: {browser_path}")
+                else:
+                    self.log("❌ 未找到 Edge/Chrome/Chromium 浏览器")
+            
             return ChromiumPage(co)
-        except:
+        except Exception:
             self.log(f"浏览器启动异常:\n{traceback.format_exc()}")
             return None
 
