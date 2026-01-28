@@ -49,9 +49,10 @@
 - 成功连接后，会自动将 `ip addr` 信息发送到你的邮箱。
 
 ### 4. Linux 下设置开机自启
-- **方式 A (GUI)**：搜索并打开“启动应用程序”(Startup Applications)，点击“添加”，命令填写：`python3 /你的路径/SHU_net_helper.py`。
+任何方式都需要桌面关闭自动锁屏、打开自动登录
+- **方式 A (GUI)**：搜索并打开“启动应用程序”(Startup Applications)，点击“添加”，命令填写：`python3 /你的路径/SHU_net_helper.py &`。
 - **方式 B (命令行)**：可以在 `~/.config/autostart/` 目录下创建一个 `.desktop` 文件。
-
+- **方式C (systemd)**:
 ---
 
 ## 常见问题 (FAQ)
@@ -70,7 +71,7 @@ A: 程序已内置 465/587 端口自动切换逻辑。如果依然失败，请�
 ##  使用步骤(win)
 
 ### 1. 下载与运行
-1.  在右侧 **Releases** 页面下载最新版本的 `SHU校园网助手.exe`：[最新版本下载](https://github.com/labourer-bobo/SHU-Campus-Net-Helper/releases/latest)
+1.  下载最新版本的 `SHU校园网助手.exe`：[最新版本下载](https://github.com/labourer-bobo/SHU-Campus-Net-Helper/releases/latest)
 2.  双击运行，程序会自动隐藏到右下角系统托盘（绿色小方块图标）。
 
 ### 2. 初始化配置

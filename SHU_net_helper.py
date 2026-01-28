@@ -79,7 +79,7 @@ class NetworkAutoLoginApp:
             return False
 
     def create_widgets(self):
-        tk.Label(self.root, text="校园网助手 v0.2.0 (IP汇报版)", font=("微软雅黑", 16, "bold")).pack(pady=10)
+        tk.Label(self.root, text="校园网助手 v0.3.0", font=("微软雅黑", 16, "bold")).pack(pady=10)
         
         # 状态显示区
         f = tk.Frame(self.root, relief="groove", bd=2)
