@@ -1,458 +1,399 @@
-import tkinter as tk
-from tkinter import messagebox, simpledialog, scrolledtext
+import queue
 import threading
 import time
-import requests
-import pystray
-from PIL import Image, ImageDraw
-from datetime import datetime
-import os
-import sys
-import json
+import tkinter as tk
 import traceback
-import subprocess
-import socket      # 用于获取主机名
-import smtplib     # 用于发送邮件
-from email.mime.text import MIMEText
-from email.header import Header
-from DrissionPage import ChromiumPage, ChromiumOptions
+from datetime import datetime
+from tkinter import messagebox, scrolledtext, simpledialog
 
-# ==================== 配置常量区 ====================
-DEFAULT_LOGIN_URL = "http://10.10.9.9"
-CHECK_URL = "http://connect.rom.miui.com/generate_204"
-CHECK_INTERVAL = 30
-LOGIN_CONFIG_FILE = "login_config.json"
-EMAIL_CONFIG_FILE = "email_config.json"
-# ====================================================
+from shu_network import (
+    CHECK_INTERVAL,
+    CONFIRM_INTERVAL,
+    DEFAULT_LOGIN_URL,
+    EMAIL_CONFIG,
+    LOGIN_CONFIG,
+    ConfigStore,
+    JobError,
+    ReconnectSchedule,
+    capture_login,
+    internet_available,
+    login,
+    portal_available,
+    send_ip_report,
+)
+
 
 class NetworkAutoLoginApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SHU校园网助手-linux v0.3.0")
-        self.root.geometry("520x550")
-        
-        # 点击窗口关闭按钮时，隐藏到托盘而不是退出
-        self.root.protocol('WM_DELETE_WINDOW', self.hide_window)
+        root.title("SHU 校园网助手 v0.2.1")
+        root.geometry("520x460")
+        root.minsize(460, 400)
+        root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        root.report_callback_exception = self.report_callback_exception
 
-        self.is_running = True
-        self.is_processing = False
-        
-        # 界面显示变量
-        self.status_var = tk.StringVar(value="后台监控中...")
-        self.last_check_var = tk.StringVar(value="--:--:--")
-        
-        # 加载配置
-        self.login_config = self.load_json(LOGIN_CONFIG_FILE)
-        self.email_config = self.load_json(EMAIL_CONFIG_FILE)
-        
+        self.events = queue.Queue()
+        self.stop = threading.Event()
+        self.reconnect = ReconnectSchedule()
+        self.config = ConfigStore()
+        self.busy = False
+        self.mail_busy = False
+        self.monitor_timer = None
+        self.tray = None
+        self.user_opened_window = False
+        self.status = tk.StringVar(value="等待检测")
+        self.last_check = tk.StringVar(value="--:--:--")
+
         self.create_widgets()
-        
-        # 启动托盘图标线程
-        try:
-            self.tray_thread = threading.Thread(target=self.setup_tray, daemon=True)
-            self.tray_thread.start()
-        except: pass
-        
-        # 启动网络监控线程
-        self.monitor_thread = threading.Thread(target=self.monitor_network, daemon=True)
-        self.monitor_thread.start()
+        self.login_config = self.load_config(LOGIN_CONFIG)
+        self.email_config = self.load_config(EMAIL_CONFIG)
+        if self.login_config is None:
+            self.log("请先录制校园网登录配置。")
 
-        # 【默认隐藏】启动时直接隐藏窗口，在后台运行
-        self.root.withdraw()
-
-    def load_json(self, filepath):
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return None
-        return None
-
-    def save_json(self, filepath, data):
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-            return True
-        except Exception as e:
-            self.log(f"保存配置失败: {e}")
-            return False
+        self.root.after(50, self.drain_events)
+        threading.Thread(target=self.run_tray, daemon=True).start()
+        self.schedule_monitor(0)
 
     def create_widgets(self):
-        tk.Label(self.root, text="校园网助手 v0.3.0", font=("微软雅黑", 16, "bold")).pack(pady=10)
-        
-        # 状态显示区
-        f = tk.Frame(self.root, relief="groove", bd=2)
-        f.pack(fill="x", padx=20, pady=5)
-        
-        tk.Label(f, text="当前网络状态：", font=("微软雅黑", 10, "bold")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        tk.Label(f, textvariable=self.status_var, fg="blue", font=("微软雅黑", 10)).grid(row=0, column=1, sticky="w")
-        
-        tk.Label(f, text="上次检测时间：", font=("微软雅黑", 10, "bold")).grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        tk.Label(f, textvariable=self.last_check_var, font=("微软雅黑", 10)).grid(row=1, column=1, sticky="w")
+        tk.Label(self.root, text="SHU 校园网助手", font=("微软雅黑", 16, "bold")).pack(pady=(15, 6))
 
-        # 功能按钮区
-        btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=10)
-        
-        tk.Button(btn_frame, text="🛠️ 1. 录制登录配置", 
-                 command=lambda: self.run_thread_safe(self.start_capture),
-                 bg="#FF5722", fg="white", width=25).pack(pady=5)
-        
-        tk.Button(btn_frame, text="📧 2. 配置汇报邮箱", 
-                 command=self.configure_email,
-                 bg="#2196F3", fg="white", width=25).pack(pady=5)
-        
-        tk.Button(btn_frame, text="🚀 3. 测试连接 & 发信", 
-                 command=lambda: self.run_thread_safe(self.perform_login),
-                 bg="#4CAF50", fg="white", width=25).pack(pady=5)
+        info = tk.Frame(self.root)
+        info.pack(fill="x", padx=20)
+        tk.Label(info, textvariable=self.status, font=("微软雅黑", 11)).pack(side="left")
+        tk.Label(info, textvariable=self.last_check).pack(side="right")
+        tk.Label(info, text="上次检测").pack(side="right", padx=6)
 
-        tk.Button(btn_frame, text="🔽 隐藏到后台", 
-                 command=self.hide_window,
-                 bg="#607D8B", fg="white", width=25).pack(pady=5)
+        controls = tk.Frame(self.root)
+        controls.pack(pady=12)
+        self.capture_button = tk.Button(controls, text="录制登录配置", command=self.start_capture)
+        self.capture_button.pack(side="left", padx=4)
+        tk.Button(controls, text="配置汇报邮箱", command=self.configure_email).pack(side="left", padx=4)
+        self.test_button = tk.Button(controls, text="测试连接并发信", command=self.test_connection)
+        self.test_button.pack(side="left", padx=4)
+        self.hide_button = tk.Button(controls, text="隐藏到托盘", command=self.hide_window, state="disabled")
+        self.hide_button.pack(side="left", padx=4)
 
-        # 日志区
-        tk.Label(self.root, text="运行日志:", anchor="w").pack(fill="x", padx=20)
-        self.log_text = scrolledtext.ScrolledText(self.root, height=8, state='disabled', font=("Consolas", 9))
-        self.log_text.pack(fill="x", padx=20, pady=5)
+        self.log_text = scrolledtext.ScrolledText(self.root, state="disabled", font=("Consolas", 10))
+        self.log_text.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
-    # 线程安全的UI更新方法
-    def log(self, msg):
-        def _log():
-            try:
-                self.log_text.config(state='normal')
-                self.log_text.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
-                self.log_text.see(tk.END)
-                self.log_text.config(state='disabled')
-            except: pass
-        self.root.after(0, _log)
-
-    def safe_status(self, msg):
-        self.root.after(0, lambda: self.status_var.set(msg))
-
-    def show_info(self, title, msg):
-        self.root.after(0, lambda: messagebox.showinfo(title, msg))
-
-    def run_thread_safe(self, target_func):
-        if self.is_processing:
-            self.show_info("提示", "当前有任务正在执行，请稍候...")
-            return
-        threading.Thread(target=target_func, daemon=True).start()
-
-    # ==================== 邮件功能模块 ====================
-    def get_ipconfig_info(self):
-        """获取本机完整的网络配置信息"""
+    def load_config(self, name):
         try:
-            if sys.platform.startswith('win'):
-                # Windows 中文系统通常是 gbk 编码
-                result = subprocess.check_output("ipconfig /all", shell=True).decode('gbk', errors='ignore')
-            else:
-                # Linux 系统通常使用 ip addr 或 ifconfig
-                try:
-                    result = subprocess.check_output("ip addr", shell=True).decode('utf-8', errors='ignore')
-                except:
-                    result = subprocess.check_output("ifconfig", shell=True).decode('utf-8', errors='ignore')
-            return result
-        except Exception as e:
-            return f"获取 IP 信息失败: {e}"
-
-    def configure_email(self):
-        """弹出配置邮箱的对话框"""
-        # 必须先显示窗口，否则弹窗可能看不见
-        self.show_window(None, None)
-        
-        smtp = simpledialog.askstring("邮箱配置(1/4)", "请输入SMTP服务器：\n(如QQ邮箱: smtp.qq.com)", initialvalue="smtp.qq.com")
-        if not smtp: return
-        sender = simpledialog.askstring("邮箱配置(2/4)", "请输入发件人邮箱：")
-        if not sender: return
-        pwd = simpledialog.askstring("邮箱配置(3/4)", "请输入【授权码】(非登录密码)：")
-        if not pwd: return
-        target = simpledialog.askstring("邮箱配置(4/4)", "请输入接收通知的邮箱：", initialvalue=sender)
-        if not target: return
-
-        data = {"smtp": smtp, "sender": sender, "pwd": pwd, "target": target}
-        if self.save_json(EMAIL_CONFIG_FILE, data):
-            self.email_config = data
-            self.log("邮箱配置已保存")
-            messagebox.showinfo("成功", "邮箱配置已保存！\n下次联网成功后将发送IP信息。")
-
-    def send_email_task(self):
-        """发送邮件的具体执行逻辑"""
-        if not self.email_config:
-            self.log("未配置邮箱，跳过发送")
-            return
-
-        self.log("正在准备发送 IP 邮件...")
-        try:
-            content = self.get_ipconfig_info()
-            cfg = self.email_config
-            
-            # 构建邮件
-            msg = MIMEText(content, 'plain', 'utf-8')
-            pc_name = socket.gethostname()
-            subject = f"【网络已连接】{pc_name} IP配置报告 - {datetime.now().strftime('%m-%d %H:%M')}"
-            
-            msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = cfg['sender']
-            msg['To'] = cfg['target']
-
-            # 尝试发送 - 先试 465 (SSL)，再试 587 (STARTTLS)
-            success = False
-            error_msgs = []
-
-            # 尝试方式 1: Port 465 (SSL)
-            try:
-                self.log(f"尝试连接 SMTP (SSL/465): {cfg['smtp']}...")
-                server = smtplib.SMTP_SSL(cfg['smtp'], 465, timeout=15)
-                server.login(cfg['sender'], cfg['pwd'])
-                server.sendmail(cfg['sender'], [cfg['target']], msg.as_string())
-                server.quit()
-                success = True
-            except Exception as e:
-                error_msgs.append(f"Port 465 失败: {e}")
-
-            # 尝试方式 2: Port 587 (STARTTLS)
-            if not success:
-                try:
-                    self.log(f"尝试连接 SMTP (STARTTLS/587): {cfg['smtp']}...")
-                    server = smtplib.SMTP(cfg['smtp'], 587, timeout=15)
-                    server.starttls()
-                    server.login(cfg['sender'], cfg['pwd'])
-                    server.sendmail(cfg['sender'], [cfg['target']], msg.as_string())
-                    server.quit()
-                    success = True
-                except Exception as e:
-                    error_msgs.append(f"Port 587 失败: {e}")
-
-            if success:
-                self.log("✅ IP 邮件发送成功！")
-            else:
-                self.log(f"❌ 邮件发送全部失败:\n" + "\n".join(error_msgs))
-
-        except Exception as e:
-            self.log(f"❌ 准备发送过程出错: {e}")
-
-    # ==================== 浏览器核心模块 ====================
-    def get_browser(self):
-        try:
-            co = ChromiumOptions()
-            co.auto_port()
-            
-            # Linux 下自动寻找浏览器路径
-            if not sys.platform.startswith('win'):
-                import shutil
-                # 尝试寻找常见的浏览器命令
-                browser_path = shutil.which('microsoft-edge') or \
-                               shutil.which('microsoft-edge-stable') or \
-                               shutil.which('google-chrome') or \
-                               shutil.which('chromium') or \
-                               shutil.which('chromium-browser')
-                
-                if browser_path:
-                    co.set_browser_path(browser_path)
-                    self.log(f"找到浏览器: {browser_path}")
-                else:
-                    self.log("❌ 未找到 Edge/Chrome/Chromium 浏览器")
-            
-            return ChromiumPage(co)
-        except Exception:
-            self.log(f"浏览器启动异常:\n{traceback.format_exc()}")
+            return self.config.load(name)
+        except (OSError, ValueError) as error:
+            self.log(f"读取 {name} 失败，需重新配置（{error}）")
             return None
 
-    def start_capture(self):
-        self.is_processing = True
-        self.safe_status("正在录制...")
-        self.show_window(None, None) # 强制前台显示
-        self.log("启动浏览器进行录制...")
-        
-        page = None
+    def save_config(self, name, config):
         try:
-            page = self.get_browser()
-            if not page: return
-
-            self.log(f"访问: {DEFAULT_LOGIN_URL}")
-            page.get(DEFAULT_LOGIN_URL)
-            
-            # JS 获取 XPath 工具
-            js_xpath = """
-            return new Promise(resolve => {
-                function getPath(e) {
-                    if (e.id) return '//*[@id="'+e.id+'"]';
-                    if (e === document.body) return e.tagName;
-                    var ix = 0;
-                    var siblings = e.parentNode.childNodes;
-                    for (var i = 0; i < siblings.length; i++) {
-                        var sibling = siblings[i];
-                        if (sibling === e) return getPath(e.parentNode) + '/' + e.tagName + '[' + (ix + 1) + ']';
-                        if (sibling.nodeType === 1 && sibling.tagName === e.tagName) ix++;
-                    }
-                }
-                document.addEventListener('click', function handler(e) {
-                    e.preventDefault(); e.stopPropagation();
-                    document.removeEventListener('click', handler, true);
-                    resolve(getPath(e.target));
-                }, true);
-            });
-            """
-
-            self.show_info("录制", "步骤 1/3：\n请点击网页上的【账号输入框】")
-            u_xp = page.run_js(js_xpath)
-            self.log(f"账号位置: {u_xp}")
-
-            self.show_info("录制", "步骤 2/3：\n请点击网页上的【密码输入框】")
-            p_xp = page.run_js(js_xpath)
-            self.log(f"密码位置: {p_xp}")
-
-            self.show_info("录制", "步骤 3/3：\n请点击网页上的【登录按钮】")
-            b_xp = page.run_js(js_xpath)
-            self.log(f"按钮位置: {b_xp}")
-
-            self.root.after(0, lambda: self._input_dialogs(u_xp, p_xp, b_xp))
-
-        except Exception:
-            self.log(f"录制错误:\n{traceback.format_exc()}")
-            if page: page.quit()
-        finally:
-            self.is_processing = False
-
-    def _input_dialogs(self, u, p, b):
-        self.show_window(None, None)
-        user = simpledialog.askstring("配置", "输入真实【账号】：")
-        if not user: return
-        pwd = simpledialog.askstring("配置", "输入真实【密码】：")
-        if not pwd: return
-        
-        cfg = {"url": DEFAULT_LOGIN_URL, "u_xp": u, "p_xp": p, "b_xp": b, "user": user, "pwd": pwd}
-        if self.save_json(LOGIN_CONFIG_FILE, cfg):
-            self.login_config = cfg
-            self.log("登录配置保存成功")
-            messagebox.showinfo("完成", "登录配置已保存！")
-
-    def perform_login(self):
-        if not self.login_config:
-            self.show_info("提示", "请先录制登录配置")
-            return
-        
-        self.is_processing = True
-        self.safe_status("正在连接...")
-        self.log("开始自动连接...")
-        page = None
-        
-        try:
-            page = self.get_browser()
-            page.get(self.login_config['url'])
-            
-            cfg = self.login_config
-
-            # 1. 填账号 (穿透式填表)
-            js_user = f"""
-            var e = document.evaluate('{cfg['u_xp']}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (e && e.tagName !== 'INPUT') e = e.querySelector('input') || e;
-            if(e) {{ 
-                e.value = '{cfg['user']}'; 
-                e.dispatchEvent(new Event('input', {{bubbles:true}})); 
-                return "OK";
-            }}
-            return "Fail";
-            """
-            page.run_js(js_user)
-            
-            # 2. 填密码 (智能识别 input[type=password])
-            js_pwd = f"""
-            var pwd = '{cfg['pwd']}';
-            var e = document.querySelector('input[type="password"]'); 
-            if (!e) e = document.evaluate('{cfg['p_xp']}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (e && e.tagName !== 'INPUT') e = e.querySelector('input') || e;
-            
-            if(e) {{ 
-                e.focus(); 
-                e.value = pwd; 
-                e.dispatchEvent(new Event('input', {{bubbles:true}})); 
-                e.dispatchEvent(new Event('change', {{bubbles:true}})); 
-                return "OK";
-            }}
-            return "Fail";
-            """
-            page.run_js(js_pwd)
-            
-            time.sleep(0.5)
-            
-            # 3. 点击按钮
-            js_btn = f"""
-            var e = document.evaluate('{cfg['b_xp']}', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if(e) {{ e.click(); return "OK"; }} return "Fail";
-            """
-            page.run_js(js_btn)
-            
-            self.log("登录动作完成，等待网络恢复...")
-            page.quit()
-            
-            # 等待几秒后检查网络
-            time.sleep(3)
-            if self.check_net():
-                self.log("网络已通，准备发送IP报告...")
-                self.send_email_task()
-            else:
-                self.log("网络似乎未通，跳过发信")
-
-        except Exception:
-            self.log(f"连接过程出错:\n{traceback.format_exc()}")
-            if page: page.quit()
-        finally:
-            self.is_processing = False
-
-    # ==================== 后台监控与托盘 ====================
-    def check_net(self):
-        try:
-            return requests.get(CHECK_URL, timeout=3).status_code == 204
-        except:
+            self.config.save(name, config)
+        except OSError as error:
+            messagebox.showerror("保存失败", str(error), parent=self.root)
             return False
+        return True
 
-    def monitor_network(self):
-        while self.is_running:
-            try:
-                if not self.is_processing:
-                    now = datetime.now().strftime("%H:%M:%S")
-                    self.root.after(0, lambda: self.last_check_var.set(now))
-                    
-                    if self.check_net():
-                        self.safe_status("在线")
-                    else:
-                        self.safe_status("离线 - 重连中...")
-                        if self.login_config:
-                            self.root.after(0, lambda: self.run_thread_safe(self.perform_login))
-            except: pass
-            time.sleep(CHECK_INTERVAL)
+    def post(self, callback, *args):
+        self.events.put((callback, args))
 
-    def create_image(self):
-        # 绘制托盘图标 (绿色方块)
-        image = Image.new('RGB', (64, 64), (0, 150, 136))
-        dc = ImageDraw.Draw(image)
-        dc.rectangle((16, 16, 48, 48), fill="white")
-        return image
-
-    def setup_tray(self):
+    def drain_events(self):
         try:
-            icon = pystray.Icon("shu_helper", self.create_image(), "SHU校园网助手", 
-                              menu=(pystray.MenuItem('显示主界面', self.show_window), 
-                                    pystray.MenuItem('彻底退出', self.quit_app_force)))
-            icon.run()
-        except: pass
+            for _ in range(100):
+                try:
+                    callback, args = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                callback(*args)
+                if self.stop.is_set() and not self.busy:
+                    return
+        finally:
+            if not self.stop.is_set() or self.busy:
+                self.root.after(50, self.drain_events)
 
-    def show_window(self, icon, item):
-        self.root.after(0, self.root.deiconify)
+    def log(self, message):
+        self.post(self.append_log, message)
+
+    def append_log(self, message):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n")
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > 501:
+            self.log_text.delete("1.0", f"{lines - 500}.0")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def report_callback_exception(self, error_type, error, trace):
+        self.log("界面操作失败\n" + "".join(traceback.format_exception(error_type, error, trace)))
+
+    def start_job(self, task, on_done, *args):
+        if self.busy or self.stop.is_set():
+            return
+        self.busy = True
+        if self.monitor_timer is not None:
+            self.root.after_cancel(self.monitor_timer)
+            self.monitor_timer = None
+
+        def work():
+            result = None
+            try:
+                result = task(*args)
+            except JobError as error:
+                self.log(str(error))
+            except Exception as error:
+                self.log(f"操作失败（{type(error).__name__}）")
+            finally:
+                self.post(self.finish_job, on_done, result)
+
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except RuntimeError:
+            self.finish_job(None, None)
+            raise
+
+    def finish_job(self, on_done, result):
+        delay = CHECK_INTERVAL
+        try:
+            if not self.stop.is_set():
+                next_delay = on_done(result) if on_done is not None else result
+                if next_delay is not None:
+                    delay = next_delay
+        finally:
+            self.busy = False
+            if self.stop.is_set():
+                self.root.destroy()
+            else:
+                self.capture_button.config(state="normal")
+                self.test_button.config(state="normal")
+                self.schedule_monitor(delay)
+
+    def schedule_monitor(self, delay):
+        self.monitor_timer = self.root.after(int(delay * 1000), self.monitor_tick)
+
+    def monitor_tick(self):
+        self.monitor_timer = None
+        self.start_job(self.check_connection, None, self.login_config, False)
+
+    def set_network_status(self, status):
+        self.post(self.status.set, status)
+
+    def probe(self):
+        online = internet_available()
+        self.post(self.last_check.set, datetime.now().strftime("%H:%M:%S"))
+        return online
+
+    def check_connection(self, config, manual):
+        if self.probe():
+            self.reconnect.reset()
+            self.set_network_status("在线")
+            if manual and not self.stop.is_set():
+                self.log("外网已连通。")
+                self.post(self.queue_email, True)
+            return CHECK_INTERVAL
+
+        if config is None:
+            self.set_network_status("外网不可达 · 待录制配置")
+            if manual:
+                self.log("外网不可达，请先录制校园网登录配置。")
+            return CHECK_INTERVAL
+
+        if not manual and not self.reconnect.ready(time.monotonic()):
+            if self.reconnect.probe_failures == 1:
+                self.set_network_status("外网探测失败 · 正在复查")
+                return CONFIRM_INTERVAL
+            self.set_network_status("外网不可达 · 等待重试")
+            return CHECK_INTERVAL
+
+        if self.stop.is_set():
+            return CHECK_INTERVAL
+        try:
+            if not portal_available(config["url"]):
+                raise JobError("认证页不可达，请检查校园网网线或 Wi-Fi")
+            self.set_network_status("正在认证…")
+            self.log("开始校园网认证。")
+            if login(config, self.stop, self.log, headless=not manual):
+                self.reconnect.reset()
+                self.set_network_status("在线")
+                self.post(self.last_check.set, datetime.now().strftime("%H:%M:%S"))
+                self.log("校园网认证完成，外网已恢复。")
+                self.post(self.queue_email, manual)
+                return CHECK_INTERVAL
+        except Exception as error:
+            self.reconnect.defer(time.monotonic())
+            reason = str(error) if isinstance(error, JobError) else f"浏览器操作失败（{type(error).__name__}）"
+            self.set_network_status("外网不可达 · 等待重试")
+            self.log(reason)
+        return CHECK_INTERVAL
+
+    def start_capture(self):
+        if self.busy:
+            self.log("正在执行其他任务，请稍后录制。")
+            return
+        self.capture_button.config(state="disabled")
+        self.test_button.config(state="disabled")
+        self.log("请在浏览器内按提示点击账号框、密码框和登录按钮。")
+        self.start_job(capture_login, self.save_login, self.stop, self.log)
+
+    def save_login(self, paths):
+        if not paths:
+            self.log("录制结束，配置未更新。")
+            return
+        previous_user = self.login_config["user"] if self.login_config else ""
+        user = simpledialog.askstring("登录配置", "校园网账号", initialvalue=previous_user, parent=self.root)
+        if not user or not user.strip():
+            return
+        password = simpledialog.askstring("登录配置", "校园网密码", show="*", parent=self.root)
+        if not password:
+            return
+        config = {
+            "url": DEFAULT_LOGIN_URL,
+            "u_xp": paths[0], "p_xp": paths[1], "b_xp": paths[2],
+            "user": user.strip(), "pwd": password,
+        }
+        if self.save_config(LOGIN_CONFIG, config):
+            self.login_config = config
+            self.reconnect.reset()
+            self.log("登录配置已保存。")
+            return 0
+
+    def test_connection(self):
+        if self.busy:
+            self.log("正在执行其他任务，请稍后测试。")
+            return
+        self.capture_button.config(state="disabled")
+        self.test_button.config(state="disabled")
+        self.log("正在测试外网连接。")
+        self.start_job(self.check_connection, None, self.login_config, True)
+
+    def configure_email(self):
+        current = self.email_config or {}
+        config = {}
+        fields = (
+            ("smtp", "SMTP 服务器（SSL 465 端口）", "smtp.qq.com"),
+            ("sender", "发件人邮箱", ""),
+            ("pwd", "邮箱 SMTP 授权码", ""),
+            ("target", "接收 IP 报告的邮箱", ""),
+        )
+        for key, prompt, default in fields:
+            if key == "target":
+                default = config["sender"]
+            options = {"show": "*"} if key == "pwd" else {}
+            value = simpledialog.askstring(
+                "邮箱配置", prompt, initialvalue=current.get(key, default), parent=self.root, **options
+            )
+            if value is None or not value.strip() or self.stop.is_set():
+                return
+            config[key] = value.strip()
+        if self.save_config(EMAIL_CONFIG, config):
+            self.email_config = config
+            self.log("邮箱配置已保存，可点击“测试连接并发信”。")
+
+    def queue_email(self, manual):
+        if self.stop.is_set():
+            return
+        if not self.email_config:
+            if manual:
+                self.log("尚未配置汇报邮箱。")
+            return
+        if self.mail_busy:
+            self.log("上一封 IP 报告正在发送。")
+            return
+        self.mail_busy = True
+        config = self.email_config
+        self.log("正在发送 IP 报告。")
+
+        def work():
+            try:
+                send_ip_report(config)
+                self.log("IP 报告已发送。")
+            except Exception as error:
+                self.log(f"邮件发送失败（{type(error).__name__}）")
+            finally:
+                self.post(self.finish_email)
+
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except RuntimeError:
+            self.finish_email()
+            raise
+
+    def finish_email(self):
+        self.mail_busy = False
+
+    def run_tray(self):
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            image = Image.new("RGB", (64, 64), (0, 150, 136))
+            ImageDraw.Draw(image).rectangle((16, 16, 48, 48), fill="white")
+            icon = pystray.Icon(
+                "shu_helper", image, "SHU 校园网助手",
+                menu=pystray.Menu(
+                    pystray.MenuItem("显示主界面", lambda *_: self.post(self.show_window), default=True),
+                    pystray.MenuItem("退出", lambda *_: self.post(self.quit)),
+                ),
+            )
+
+            def setup(ready_icon):
+                if self.stop.is_set():
+                    ready_icon.stop()
+                    return
+                try:
+                    ready_icon.visible = True
+                except Exception:
+                    self.log("托盘图标不可用，窗口保持可见。")
+                    ready_icon.stop()
+                else:
+                    if self.stop.is_set():
+                        ready_icon.stop()
+                    else:
+                        self.post(self.tray_ready, ready_icon)
+
+            icon.run(setup=setup)
+        except Exception:
+            self.log("托盘启动失败，窗口保持可见。")
+        finally:
+            self.post(self.tray_closed)
+
+    def tray_ready(self, icon):
+        if self.stop.is_set():
+            icon.stop()
+            return
+        self.tray = icon
+        self.hide_button.config(state="normal")
+        if self.login_config and not self.user_opened_window:
+            self.root.withdraw()
+
+    def tray_closed(self):
+        self.tray = None
+        if not self.stop.is_set():
+            self.hide_button.config(state="disabled")
+            self.root.deiconify()
+
+    def show_window(self):
+        self.user_opened_window = True
+        self.root.deiconify()
+        self.root.lift()
 
     def hide_window(self):
-        self.root.withdraw()
+        if self.tray is not None:
+            self.root.withdraw()
+        else:
+            self.quit()
 
-    def quit_app_force(self, icon=None, item=None):
-        self.is_running = False
-        os._exit(0)
+    def quit(self):
+        if self.stop.is_set():
+            return
+        self.stop.set()
+        self.status.set("正在退出…")
+        if self.monitor_timer is not None:
+            self.root.after_cancel(self.monitor_timer)
+            self.monitor_timer = None
+        if self.tray is not None:
+            self.tray.stop()
+        if not self.busy:
+            self.root.destroy()
+
 
 if __name__ == "__main__":
-    try:
-        root = tk.Tk()
-        app = NetworkAutoLoginApp(root)
-        root.mainloop()
-    except Exception as e:
-        messagebox.showerror("Error", str(e))
+    window = tk.Tk()
+    NetworkAutoLoginApp(window)
+    window.mainloop()
